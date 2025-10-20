@@ -9,10 +9,12 @@ from rapidfuzz import fuzz
 app = typer.Typer(add_completion=False)
 
 def _norm(s: str) -> str:
-    """Normalize a header string for matching."""
-    s = s.lower()
-    s = re.sub(r"[\s_/|-]+", " ", s)         # collapse separators
-    s = re.sub(r"[^a-z0-9 ]+", "", s)        # remove punctuation
+    if not isinstance(s, str):
+        return ""
+    s = s.strip().lower()
+    s = s.replace("\u00A0", " ")  # NBSP -> space
+    s = re.sub(r"[\s_/|,-]+", " ", s)  # unify separators
+    s = re.sub(r"[^a-z0-9 ]+", "", s)  # drop punctuation
     return " ".join(s.split())
 
 def _split_keywords(s: str, sep: str) -> List[str]:
@@ -43,54 +45,38 @@ def _pairwise_best_scores(fac_kw: List[str], fund_kw: List[str]) -> Tuple[float,
     matches.sort(key=lambda x: (-x[2], x[0]))
     return best_overall, matches
 
-def _map_columns(df: pd.DataFrame, required: Dict[str, List[str]]) -> Dict[str, str]:
+def _map_columns_best(df: pd.DataFrame, required_aliases: Dict[str, List[str]]) -> Dict[str, str]:
     """
-    Map from dataframe's actual column names -> standardized names using
-    alias lists and fuzzy matching. Returns dict of {actual_col: std_name}.
-    Raises ValueError if some required std_name cannot be mapped.
+    For each required standard name, choose the actual column with the best fuzzy score
+    against any alias. Always choose *something* (best available), then report mapping.
     """
-    # Precompute normalized headers
     actual_cols = list(df.columns)
     norm_actual = {_norm(c): c for c in actual_cols}
 
-    mapping: Dict[str, str] = {}  # actual_col -> std_name
-    debug_rows = []               # for printing what we detected
+    mapping: Dict[str, str] = {}
+    debug = []
 
-    for std_name, aliases in required.items():
-        # Build a candidate list with fuzzy scores
-        best_col: Optional[str] = None
+    for std, aliases in required_aliases.items():
+        best_col = None
         best_score = -1
-
-        # Try exact/contains on normalized first
-        alias_norms = [_norm(a) for a in aliases]
-        for na, ac in norm_actual.items():
-            # If any alias is fully contained in the normalized actual header, take it
-            if any(an in na for an in alias_norms):
-                # prefer the longest alias match
-                score = max(len(an) for an in alias_norms if an in na)
-                if score > best_score:
-                    best_score = score
-                    best_col = ac
-
-        # If not found, fall back to fuzzy (token_set_ratio) vs best alias
+        for ac in actual_cols:
+            na = _norm(ac)
+            # Best score vs any alias
+            score = max(fuzz.token_set_ratio(na, _norm(alias)) for alias in aliases)
+            if score > best_score:
+                best_score = score
+                best_col = ac
+        # Fallback: if nothing reasonable, pick the first column
         if best_col is None:
-            for ac in actual_cols:
-                na = _norm(ac)
-                score = max(fuzz.token_set_ratio(na, an) for an in alias_norms)
-                if score > best_score:
-                    best_score = score
-                    best_col = ac
+            best_col = actual_cols[0]
+            best_score = 0
+        mapping[best_col] = std
+        debug.append((std, best_col, best_score))
 
-        # Threshold: if even fuzzy is very low (<40), consider it unreliable
-        if best_col is None or best_score < 40:
-            raise ValueError(f"Missing required column in Excel: '{std_name}'")
-        mapping[best_col] = std_name
-        debug_rows.append((std_name, best_col, best_score))
-
-    # Pretty print detected mapping
     print("[cyan]Detected column mapping:[/cyan]")
-    for std_name, ac, score in sorted(debug_rows, key=lambda x: x[0]):
-        print(f"  [bold]{std_name}[/bold]  <-  '{ac}'  (score {score})")
+    for std, ac, sc in sorted(debug, key=lambda x: x[0]):
+        print(f"  [bold]{std}[/bold]  <-  '{ac}'  (score {sc})")
+
     return mapping
 
 @app.command()
@@ -101,58 +87,48 @@ def main(
     score_threshold: int = typer.Option(60, help="Only include matches with score >= this (0-100)"),
     top_n_per_faculty: int = typer.Option(20, help="Max foundations to keep per faculty after filtering")
 ):
-    """
-    Read two Excel files, do keyword + fuzzy matching, and write ranked matches to Excel.
-    """
     print(f"[bold]Reading[/bold] foundations from: {foundations}")
     print(f"[bold]Reading[/bold] faculty from: {faculty}")
 
     fnd = pd.read_excel(foundations)
     fac = pd.read_excel(faculty)
 
-    # Define flexible aliases for headers (common human variants)
+    # Your files’ likely variants (based on what you pasted)
     foundation_required = {
         "Foundation Name": [
-            "foundation name", "funder", "funder name", "name"
+            "foundation name", "funder name", "organization", "sponsor", "foundation"
         ],
         "Area of Funding": [
-            "area of funding", "funding area", "focus areas", "research areas",
-            "keywords", "keywords comma separated", "area of funding with keywords",
-            "areas", "topics"
+            "area of funding", "areas of funding", "area(s) of funding", "focus areas", "funding area", "keywords"
         ],
         "Average Grant": [
-            "average grant", "average award", "typical award", "award size",
-            "grant amount", "amount (high/medium/low)", "funding level"
+            "average grant", "average grant amount", "typical award", "award size", "funding level", "grant amount"
         ],
         "Career Stage Targeted": [
-            "career stage targeted", "career stage", "targeted career stage",
-            "eligibility career stage", "stage"
+            "career stage targeted", "career stage", "targeted career stage", "eligibility career stage", "stage"
         ],
         "Deadlines/Restrictions": [
-            "deadlines/restrictions", "deadlines and restrictions",
-            "deadlines", "restrictions", "notes"
+            "deadlines restrictions", "deadlines, restrictions", "deadlines", "restrictions", "notes"
         ],
         "Institution Preference": [
-            "institution preference", "institution specific preferences",
-            "institution-specific preferences", "country", "region",
-            "us only", "us", "eligibility location"
+            "institution specific preferences", "institution preference", "us only", "country", "region", "eligibility location"
         ],
         "Website": [
-            "website", "url", "link", "homepage"
+            "website", "website link", "url", "link", "homepage"
         ],
     }
     faculty_required = {
-        "Name": ["name", "faculty", "faculty name"],
-        "Degree": ["degree", "degrees", "credentials"],
-        "Rank": ["rank", "title (rank)", "academic rank", "assistant/associate/full"],
-        "Division": ["division", "dept division", "unit"],
+        "Name": ["name", "faculty name"],
+        "Degree": ["degree", "degrees"],
+        "Rank": ["rank", "academic rank"],
+        "Division": ["division", "division ", "dept division", "unit"],
         "Career Stage": ["career stage", "stage", "early/mid/late", "career level"],
-        "Keywords": ["keywords", "research keywords", "topics", "interests", "keywords semicolon separated"],
+        "Keywords": ["keywords", "research keywords", "topics", "interests", "keywords; separated"],
     }
 
-    # Map and rename columns according to best matches
-    fnd_map = _map_columns(fnd, foundation_required)
-    fac_map = _map_columns(fac, faculty_required)
+    # Map/rename
+    fnd_map = _map_columns_best(fnd, foundation_required)
+    fac_map = _map_columns_best(fac, faculty_required)
     fnd = fnd.rename(columns=fnd_map)
     fac = fac.rename(columns=fac_map)
 
@@ -173,7 +149,6 @@ def main(
             fund_kws = fnd_row["__kw"]
 
             score, pairs = _pairwise_best_scores(fac_kws, fund_kws)
-
             if score >= score_threshold and pairs:
                 why = "; ".join([f"{a} ~ {b} ({s})" for a, b, s in pairs[:5]])
                 match_count = sum(1 for _, _, s in pairs if s >= score_threshold)
@@ -202,7 +177,6 @@ def main(
         by=["Faculty", "Match Score (0-100)", "Matched Keyword Count"],
         ascending=[True, False, False]
     )
-
     out.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_excel(out, index=False)
     print(f"[bold green]Wrote matches:[/bold green] {out}  (rows: {len(out_df)})")
