@@ -46,37 +46,26 @@ def _pairwise_best_scores(fac_kw: List[str], fund_kw: List[str]) -> Tuple[float,
     return best_overall, matches
 
 def _map_columns_best(df: pd.DataFrame, required_aliases: Dict[str, List[str]]) -> Dict[str, str]:
-    """
-    For each required standard name, choose the actual column with the best fuzzy score
-    against any alias. Always choose *something* (best available), then report mapping.
-    """
+    """Choose the actual column with the best fuzzy score vs any alias for each required std name."""
     actual_cols = list(df.columns)
-    norm_actual = {_norm(c): c for c in actual_cols}
-
     mapping: Dict[str, str] = {}
     debug = []
-
     for std, aliases in required_aliases.items():
         best_col = None
         best_score = -1
         for ac in actual_cols:
             na = _norm(ac)
-            # Best score vs any alias
             score = max(fuzz.token_set_ratio(na, _norm(alias)) for alias in aliases)
             if score > best_score:
                 best_score = score
                 best_col = ac
-        # Fallback: if nothing reasonable, pick the first column
         if best_col is None:
-            best_col = actual_cols[0]
-            best_score = 0
+            raise ValueError(f"Missing required column for '{std}'")
         mapping[best_col] = std
         debug.append((std, best_col, best_score))
-
     print("[cyan]Detected column mapping:[/cyan]")
     for std, ac, sc in sorted(debug, key=lambda x: x[0]):
         print(f"  [bold]{std}[/bold]  <-  '{ac}'  (score {sc})")
-
     return mapping
 
 @app.command()
@@ -85,7 +74,8 @@ def main(
     faculty: Path = typer.Option(..., "--faculty", "-p", help="Path to faculty Excel (xlsx)"),
     out: Path = typer.Option(Path("outputs/matches.xlsx"), "--out", "-o", help="Output Excel path"),
     score_threshold: int = typer.Option(60, help="Only include matches with score >= this (0-100)"),
-    top_n_per_faculty: int = typer.Option(20, help="Max foundations to keep per faculty after filtering")
+    top_n_per_faculty: int = typer.Option(20, help="Max foundations to keep per faculty after filtering"),
+    use_weights: bool = typer.Option(False, "--use-weights/--no-use-weights", help="Apply grant and stage weighting.")
 ):
     print(f"[bold]Reading[/bold] foundations from: {foundations}")
     print(f"[bold]Reading[/bold] faculty from: {faculty}")
@@ -93,7 +83,6 @@ def main(
     fnd = pd.read_excel(foundations)
     fac = pd.read_excel(faculty)
 
-    # Your files’ likely variants (based on what you pasted)
     foundation_required = {
         "Foundation Name": [
             "foundation name", "funder name", "organization", "sponsor", "foundation"
@@ -126,15 +115,27 @@ def main(
         "Keywords": ["keywords", "research keywords", "topics", "interests", "keywords; separated"],
     }
 
-    # Map/rename
     fnd_map = _map_columns_best(fnd, foundation_required)
     fac_map = _map_columns_best(fac, faculty_required)
     fnd = fnd.rename(columns=fnd_map)
     fac = fac.rename(columns=fac_map)
 
-    # Pre-split keywords
     fnd["__kw"] = fnd["Area of Funding"].fillna("").astype(str).map(lambda s: _split_keywords(s, sep=","))
     fac["__kw"] = fac["Keywords"].fillna("").astype(str).map(lambda s: _split_keywords(s, sep=";"))
+
+    # Grant level mapping
+    def _grant_multiplier(val: str) -> float:
+        v = (val or "").strip().lower()
+        if v.startswith("h"):   # high
+            return 1.0
+        if v.startswith("m"):   # medium
+            return 0.6
+        if v.startswith("l"):   # low
+            return 0.3
+        return 0.6  # unknown -> mediumish
+
+    def _stage_matches(fac_stage: str, fund_stage: str) -> bool:
+        return (fac_stage or "").strip().lower() == (fund_stage or "").strip().lower()
 
     rows = []
     for _, fac_row in fac.iterrows():
@@ -148,9 +149,28 @@ def main(
             fund_name = str(fnd_row["Foundation Name"])
             fund_kws = fnd_row["__kw"]
 
-            score, pairs = _pairwise_best_scores(fac_kws, fund_kws)
-            if score >= score_threshold and pairs:
+            keyword_score, pairs = _pairwise_best_scores(fac_kws, fund_kws)
+            if not pairs:
+                continue
+
+            final_score = keyword_score
+            why_suffix = ""
+
+            if use_weights:
+                # Weighted blend: 60% keyword, 20% grant, 20% stage
+                grant_mult = _grant_multiplier(str(fnd_row.get("Average Grant", "")))
+                grant_score = 100.0 * grant_mult
+                stage_score = 100.0 if _stage_matches(fac_stage, str(fnd_row.get("Career Stage Targeted", ""))) else 0.0
+                final_score = int(round(
+                    0.6 * keyword_score + 0.2 * grant_score + 0.2 * stage_score
+                ))
+                final_score = max(0, min(100, final_score))
+                why_suffix = f" | weights: grant={grant_mult:.1f}, stage={'match' if stage_score>0 else 'no-match'}"
+
+            if final_score >= score_threshold:
                 why = "; ".join([f"{a} ~ {b} ({s})" for a, b, s in pairs[:5]])
+                if why_suffix:
+                    why += why_suffix
                 match_count = sum(1 for _, _, s in pairs if s >= score_threshold)
                 rows.append({
                     "Faculty": fac_name,
@@ -159,7 +179,7 @@ def main(
                     "Career Stage": fac_stage,
                     "Top Keywords": "; ".join(fac_kws[:10]),
                     "Foundation": fund_name,
-                    "Match Score (0-100)": score,
+                    "Match Score (0-100)": final_score,
                     "Matched Keyword Count": match_count,
                     "Why Matched (top)": why,
                     "Average Grant": fnd_row.get("Average Grant", ""),
